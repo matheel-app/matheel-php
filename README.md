@@ -63,6 +63,39 @@ On 200 it writes the new token. On `409 device_token_reused` it re-reads the tok
 error it leaves the token alone and throws `Matheel\MatheelError` (`status`, `body`, `errorCode`): fix the invoice and
 resend.
 
+## Payments and refunds, done for you: `PdoQueue`
+
+One table does the whole job a payment app needs: one invoice per payment (a gateway that notifies twice never makes
+two), credit notes for full or partial refunds linked to the original invoice, automatic retries in order when ZATCA or
+Matheel is down, and the legal XML plus the PDF archived on disk. MySQL, PostgreSQL or SQLite.
+
+```php
+use Matheel\Matheel;
+use Matheel\PdoQueue;
+
+$queue = new PdoQueue($pdo, new Matheel(getenv('MATHEEL_KEY')), '/var/invoices');
+$queue->install();                 // once: creates matheel_device and matheel_invoices
+$queue->setToken($deviceToken);    // once: the device_token from onboarding
+
+// After the gateway confirms a payment (Telr: verify it with Matheel::verifyTelr first):
+$row = $queue->invoice($tranRef, [
+    'type' => 'simplified',
+    'prices_include_vat' => true,
+    'line_items' => [['name' => 'Renewal', 'quantity' => 1, 'amount' => '172.50']],
+]);
+// $row['status']: reported | cleared | queued (ZATCA down: filed later) | rejected (see $row['error'])
+// $row['pdf_path'], $row['xml_path'], $row['qr'], $row['number']
+
+// A full or partial refund: the refunded lines only.
+$queue->refund($refundRef, $tranRef, [['name' => 'Renewal', 'quantity' => 1, 'amount' => '172.50']], 'Customer refund');
+
+// Cron, every 5 minutes: files whatever is still queued, oldest first.
+$queue->process();
+```
+
+Simplified invoices may be reported up to 24 hours after issue, so an outage only delays them. Tested on PHP 7.4 and
+8.3 against ZATCA's developer sandbox (invoice, duplicate notification, partial refund).
+
 ## API
 
 | | |

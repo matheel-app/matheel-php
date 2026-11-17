@@ -8,7 +8,7 @@ namespace Matheel;
 /** A client for the Matheel API; the key is optional on the sandbox. */
 class Matheel
 {
-    public const VERSION = '0.1.0';
+    public const VERSION = '0.2.0';
     public const DEFAULT_BASE_URL = 'https://matheel.app';
 
     private const TELR_FIELDS = [
