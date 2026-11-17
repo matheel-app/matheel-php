@@ -8,8 +8,11 @@ namespace Matheel;
 /** A client for the Matheel API; the key is optional on the sandbox. */
 class Matheel
 {
-    public const VERSION = '0.2.0';
+    public const VERSION = '0.3.0';
     public const DEFAULT_BASE_URL = 'https://matheel.app';
+
+    /** 422 codes that are the document's own fault: fix the input, never resend it unchanged. */
+    private const PERMANENT = ['zatca_rejected', 'invalid', 'missing_fields', 'invalid_amount', 'validation_failed'];
 
     private const TELR_FIELDS = [
         'tran_store', 'tran_type', 'tran_class', 'tran_test', 'tran_ref', 'tran_prevref', 'tran_firstref', 'tran_order',
@@ -31,13 +34,17 @@ class Matheel
         $this->timeout = $timeout;
     }
 
-    /** POSTs JSON and returns [status, parsed body]; status 0 on a network failure. Tests override this to mock HTTP. */
+    /**
+     * POSTs JSON and returns [status, parsed body, Retry-After seconds or null]; status 0 on a network failure.
+     * Tests override this to mock HTTP (the third element may be left out).
+     */
     protected function send(string $path, array $body): array
     {
         $headers = ['Content-Type: application/json', 'Accept: application/json', 'User-Agent: matheel-php/' . self::VERSION];
         if ($this->key) {
             $headers[] = 'Authorization: Bearer ' . $this->key;
         }
+        $retryAfter = null;
         $ch = curl_init($this->baseUrl . $path);
         curl_setopt_array($ch, [
             CURLOPT_POST => true,
@@ -45,6 +52,12 @@ class Matheel
             CURLOPT_TIMEOUT => $this->timeout,
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            CURLOPT_HEADERFUNCTION => function ($ch, string $line) use (&$retryAfter): int {
+                if (stripos($line, 'retry-after:') === 0) {
+                    $retryAfter = (int) trim(substr($line, 12));
+                }
+                return strlen($line);
+            },
         ]);
         // Some networks between a cloud host and Matheel's edge drop the large post-quantum ClientHello that
         // OpenSSL 3.5 sends by default (measured 2026-11-17: PHP curl failed, the same call with X25519 succeeded).
@@ -56,19 +69,26 @@ class Matheel
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         if ($raw === false) {
             $error = curl_error($ch);
-            return [0, ['error' => 'network_error', 'message' => $error]];
+            return [0, ['error' => 'network_error', 'message' => $error], null];
         }
         // No curl_close: it does nothing since PHP 8.0 and is deprecated in 8.5; the handle is freed with $ch.
         $parsed = $raw === '' ? [] : json_decode($raw, true);
-        return [$status, is_array($parsed) ? $parsed : ['error' => 'invalid_json', 'raw' => $raw]];
+        return [$status, is_array($parsed) ? $parsed : ['error' => 'invalid_json', 'raw' => $raw], $retryAfter];
+    }
+
+    /** Waits before a retry; tests override it so they never sleep. */
+    protected function pause(int $seconds): void
+    {
+        sleep($seconds);
     }
 
     /** POSTs JSON to an API path and returns the parsed body; throws MatheelError on any status but 200. */
     public function post(string $path, array $body): array
     {
-        [$status, $parsed] = $this->send($path, $body);
+        $answer = $this->send($path, $body);
+        [$status, $parsed] = $answer;
         if ($status !== 200) {
-            throw new MatheelError($status, $parsed);
+            throw new MatheelError($status, $parsed, $answer[2] ?? null);
         }
         return $parsed;
     }
@@ -91,27 +111,78 @@ class Matheel
     }
 
     /**
-     * Files with the token in `$store`: writes the new token on 200, re-reads and retries on 409 device_token_reused
-     * (up to `$options['retries']`, default 3), leaves the token untouched on any other error (and throws).
+     * Files with the token in `$store` and returns the 200 answer, after writing its `device_token`.
+     *
+     * `$options`: `uuid` (the document's stored UUID v4, put into the invoice when it has none; one is generated
+     * otherwise, so keep the invoice's uuid and send it on every attempt), `retries` (default 3), `pdf` and any
+     * fileInvoice key. 409 `device_token_reused` with `latest_device_token`: writes it and sends this invoice again;
+     * without it, re-reads the store and retries. 409 `filing_in_progress`: waits Retry-After (at most 10 s) and
+     * retries. Anything else (409 `already_filed` included) throws MatheelError with the token untouched; `classify()` says what to do with it.
+     * A 200 without `device_token` throws `invalid_response` (status 0): resend the same request.
      */
     public function fileWithStore(TokenStore $store, array $invoice, array $options = []): array
     {
         $retries = $options['retries'] ?? 3;
-        unset($options['retries']);
+        if (empty($invoice['uuid'])) {
+            $invoice['uuid'] = $options['uuid'] ?? self::uuid4();
+        }
+        unset($options['retries'], $options['uuid']);
         for ($attempt = 0; ; $attempt++) {
             try {
                 $res = $this->fileInvoice(['deviceToken' => $store->read(), 'invoice' => $invoice] + $options);
             } catch (MatheelError $e) {
-                if ($e->status === 409 && $e->errorCode === 'device_token_reused' && $attempt < $retries) {
+                if ($attempt >= $retries || $e->status !== 409) {
+                    throw $e;
+                }
+                $latest = $e->body['error']['latest_device_token'] ?? null;
+                if ($e->errorCode === 'device_token_reused' && is_string($latest) && $latest !== '') {
+                    $store->write($latest);
+                    continue;
+                }
+                if ($e->errorCode === 'device_token_reused') {
+                    continue; // an older server: another worker may have saved a newer token since
+                }
+                if ($e->errorCode === 'filing_in_progress') {
+                    $this->pause(max(1, min($e->retryAfter ?? 5, 10)));
                     continue;
                 }
                 throw $e;
             }
-            if (!empty($res['device_token'])) {
-                $store->write($res['device_token']);
+            if (!is_string($res['device_token'] ?? null) || $res['device_token'] === '') {
+                throw new MatheelError(0, ['error' => ['code' => 'invalid_response', 'message' => '200 without device_token'], 'answer' => $res]);
             }
+            $store->write($res['device_token']);
             return $res;
         }
+    }
+
+    /**
+     * What to do with a failed filing: `retryable` (send the same request later: same token source, same uuid),
+     * `permanent` (the document is wrong: fix it; the token is unchanged), `needs_attention` (not the document's
+     * fault, e.g. a bad key, an expired CSID or no production plan: keep it queued, alert a person, retry later) or
+     * `already_filed` (ZATCA accepted this uuid earlier, `error.counter` and `error.zatca_uuid`: it is filed, never resend it).
+     */
+    public static function classify(MatheelError $e): string
+    {
+        if ($e->errorCode === 'already_filed') {
+            return 'already_filed';
+        }
+        if ($e->status === 0 || $e->status === 409 || $e->status === 429 || $e->status >= 500 || $e->errorCode === 'filing_failed') {
+            return 'retryable';
+        }
+        if ($e->status === 422 && in_array($e->errorCode, self::PERMANENT, true)) {
+            return 'permanent';
+        }
+        return 'needs_attention';
+    }
+
+    /** A random UUID v4: generate one per business document, store it, and send it on every attempt. */
+    public static function uuid4(): string
+    {
+        $b = random_bytes(16);
+        $b[6] = chr(ord($b[6]) & 0x0f | 0x40);
+        $b[8] = chr(ord($b[8]) & 0x3f | 0x80);
+        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($b), 4));
     }
 
     /** Registers a device with ZATCA (POST /api/v1/onboarding): keys `environment`, `seller`, optional `device`, `otp`. */

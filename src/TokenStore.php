@@ -11,6 +11,6 @@ interface TokenStore
     /** Returns the current device token, locking its row. */
     public function read(): string;
 
-    /** Saves the token returned by an accepted invoice. */
+    /** Saves the token of an accepted invoice, or the `latest_device_token` a 409 sent back for a stale one. */
     public function write(string $token): void;
 }

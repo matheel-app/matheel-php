@@ -61,17 +61,26 @@ class MockMatheel extends Matheel
 {
     public $answers;
     public $calls = [];
+    public $slept = [];
 
+    /** Queues the scripted answers. */
     public function __construct(array $answers, ?string $key = null)
     {
         parent::__construct($key);
         $this->answers = $answers;
     }
 
+    /** Records the request and returns the next scripted answer. */
     protected function send(string $path, array $body): array
     {
         $this->calls[] = [$path, $body];
         return array_shift($this->answers);
+    }
+
+    /** Records the wait instead of sleeping. */
+    protected function pause(int $seconds): void
+    {
+        $this->slept[] = $seconds;
     }
 }
 
@@ -82,17 +91,20 @@ class MemoryStore implements TokenStore
     public $reads = 0;
     public $writes = [];
 
+    /** Starts with `$token`. */
     public function __construct(string $token)
     {
         $this->token = $token;
     }
 
+    /** Returns the token and counts the read. */
     public function read(): string
     {
         $this->reads++;
         return $this->token;
     }
 
+    /** Saves the token and records the write. */
     public function write(string $token): void
     {
         $this->writes[] = $token;
@@ -152,14 +164,66 @@ check('verifyTelr checks tran_check with and without tran_order', function () {
     eq(false, Matheel::verifyTelr($f, 'secret'));
 });
 
-check('fileWithStore: 409 then 200 re-reads the token, writes the new one once', function () {
+check('fileWithStore: 409 without latest_device_token (older server) re-reads the token, writes the new one once', function () {
     $m = new MockMatheel([[409, ['error' => ['code' => 'device_token_reused']]], [200, ['status' => 'reported', 'device_token' => 'mdt1.new']]]);
     $store = new MemoryStore('mdt1.old');
-    $res = $m->fileWithStore($store, ['type' => 'simplified'], ['pdf' => true]);
+    $res = $m->fileWithStore($store, ['type' => 'simplified'], ['pdf' => true, 'uuid' => 'u-1']);
     eq('reported', $res['status']);
     eq(['mdt1.new'], $store->writes);
     eq(2, $store->reads);
-    eq(['/api/v1/invoices', ['invoice' => ['type' => 'simplified'], 'device_token' => 'mdt1.old', 'pdf' => true]], $m->calls[1]);
+    eq(['/api/v1/invoices', ['invoice' => ['type' => 'simplified', 'uuid' => 'u-1'], 'device_token' => 'mdt1.old', 'pdf' => true]], $m->calls[1]);
+});
+
+check('fileWithStore: 409 with latest_device_token stores it and sends the same invoice again with it', function () {
+    $stale = ['error' => ['code' => 'device_token_reused', 'latest_device_token' => 'mdt1.latest', 'latest_counter' => 7]];
+    $m = new MockMatheel([[409, $stale], [200, ['status' => 'reported', 'device_token' => 'mdt1.next', 'counter' => 8]]]);
+    $store = new MemoryStore('mdt1.old');
+    $m->fileWithStore($store, ['type' => 'simplified']);
+    eq(['mdt1.latest', 'mdt1.next'], $store->writes);
+    eq(['mdt1.old', 'mdt1.latest'], [$m->calls[0][1]['device_token'], $m->calls[1][1]['device_token']]);
+    eq(1, preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/', $m->calls[0][1]['invoice']['uuid']));
+    eq($m->calls[0][1]['invoice']['uuid'], $m->calls[1][1]['invoice']['uuid'], 'one uuid for every attempt:');
+});
+
+check('fileWithStore: filing_in_progress waits Retry-After (at most 10 s) and retries', function () {
+    $busy = ['error' => ['code' => 'filing_in_progress']];
+    $m = new MockMatheel([[409, $busy, 3], [409, $busy, 60], [200, ['status' => 'reported', 'device_token' => 'mdt1.new']]]);
+    $m->fileWithStore(new MemoryStore('mdt1.old'), ['uuid' => 'u-2']);
+    eq([3, 10], $m->slept);
+    eq(3, count($m->calls));
+});
+
+check('fileWithStore: 409 already_filed is not retried and leaves the token alone', function () {
+    $m = new MockMatheel([[409, ['error' => ['code' => 'already_filed', 'counter' => 3, 'zatca_uuid' => 'z-3']]]]);
+    $store = new MemoryStore('mdt1.old');
+    $e = throws(function () use ($m, $store) { $m->fileWithStore($store, ['uuid' => 'u-3']); });
+    eq(['already_filed', 1, []], [$e->errorCode, count($m->calls), $store->writes]);
+});
+
+check('fileWithStore: a 200 without device_token throws invalid_response and writes nothing', function () {
+    $m = new MockMatheel([[200, ['status' => 'reported']]]);
+    $store = new MemoryStore('mdt1.old');
+    $e = throws(function () use ($m, $store) { $m->fileWithStore($store, []); });
+    eq([0, 'invalid_response', 'retryable'], [$e->status, $e->errorCode, Matheel::classify($e)]);
+    eq([], $store->writes);
+});
+
+check('classify follows the filing contract', function () {
+    $cases = [
+        [0, ['error' => 'network_error'], 'retryable'], [504, ['error' => ['code' => 'filing_outcome_unknown']], 'retryable'],
+        [503, ['error' => ['code' => 'zatca_unavailable']], 'retryable'], [429, ['error' => 'sandbox_rate_limited'], 'retryable'],
+        [409, ['error' => ['code' => 'previous_filing_unknown', 'uuid' => 'x']], 'retryable'], [502, [], 'retryable'],
+        [422, ['error' => ['code' => 'filing_failed']], 'retryable'],
+        [422, ['status' => 'rejected', 'errors' => [['code' => 'BR-KSA-08']], 'error' => ['code' => 'zatca_rejected']], 'permanent'],
+        [422, ['error' => ['code' => 'invalid']], 'permanent'], [422, ['error' => ['code' => 'missing_fields']], 'permanent'],
+        [422, ['error' => ['code' => 'invalid_amount']], 'permanent'], [422, ['error' => ['code' => 'validation_failed']], 'permanent'],
+        [409, ['error' => ['code' => 'already_filed', 'counter' => 3, 'zatca_uuid' => 'z']], 'already_filed'],
+        [401, ['error' => 'invalid_api_key'], 'needs_attention'], [401, ['error' => ['code' => 'invalid_csid']], 'needs_attention'],
+        [402, ['error' => 'production_plan_required'], 'needs_attention'], [422, ['error' => ['code' => 'invalid_device_token']], 'needs_attention'],
+    ];
+    foreach ($cases as [$status, $body, $kind]) {
+        eq($kind, Matheel::classify(new MatheelError($status, $body)), "$status " . json_encode($body));
+    }
 });
 
 check('fileWithStore: a rejection leaves the token untouched and throws a typed error', function () {
@@ -195,10 +259,7 @@ check('error codes come from a string error', function () {
 
 if (getenv('MATHEEL_OFFLINE') !== '1') {
     check('live: files a simplified invoice on the keyless sandbox, with PDF and QR', function () {
-        $d = random_bytes(16);
-        $d[6] = chr(ord($d[6]) & 0x0f | 0x40);
-        $d[8] = chr(ord($d[8]) & 0x3f | 0x80);
-        $uuid = vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($d), 4));
+        $uuid = Matheel::uuid4();
         $res = (new Matheel())->fileInvoice([
             'environment' => 'sandbox',
             'pdf' => true,

@@ -1,3 +1,21 @@
+## 0.3.0
+
+* `fileWithStore`: takes a `uuid` option (else generates one, the same for every retry inside the call); on 409
+  `device_token_reused` writes `latest_device_token` and resends; on 409 `filing_in_progress` waits Retry-After (at most
+  10 s) and retries; a 200 without `device_token` throws `invalid_response` (status 0) instead of passing as success.
+* `Matheel::classify($e)`: `retryable`, `permanent`, `needs_attention` or `already_filed`, per the filing contract.
+  `Matheel::uuid4()`. `MatheelError::$retryAfter`.
+* `PdoQueue`: a uuid per row, sent on every attempt (credit notes get their own); token, status, number, zatca_uuid,
+  QR and the legal XML (new `invoice_xml` column) commit in one transaction, disk copies are written after commit and
+  never fail a filing; `rejected` only for document errors, new `attention` status for 401/402 (still retried) and
+  `attention()` to list rows needing a person (also rows queued over 12 hours and `already_filed` rows with no XML);
+  409 `already_filed` marks the row filed and never resends it; an unanswered filing stops the run so its exact
+  request is resent first, while a credit note waiting for its original no longer blocks other rows; a credit note on
+  a rejected original is refused (`refund()`) or rejected (`process()`); `refund()` drops the original's number, uuid,
+  issued_at, totals and counter; `invoice()` files only its own row; `setToken` runs under the filing lock; database
+  errors propagate and roll back; a caller's open transaction throws `LogicException`; `install()` migrates 0.2.0
+  tables (adds `uuid`, `invoice_xml`, an index on status) and gives pending rows a uuid.
+
 ## 0.2.0
 
 * `PdoQueue`: one invoice per payment (duplicate notifications are ignored), credit notes for full and partial refunds,

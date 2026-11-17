@@ -14,12 +14,15 @@ class MatheelError extends \RuntimeException
     public $body;
     /** @var string */
     public $errorCode;
+    /** @var int|null */
+    public $retryAfter;
 
-    /** Builds the error from the HTTP status and the parsed response body. @param mixed $body */
-    public function __construct(int $status, $body)
+    /** Builds the error from the HTTP status, the parsed response body and the Retry-After seconds. @param mixed $body */
+    public function __construct(int $status, $body, ?int $retryAfter = null)
     {
         $this->status = $status;
         $this->body = $body;
+        $this->retryAfter = $retryAfter;
         $this->errorCode = self::codeOf($status, $body);
         parent::__construct("Matheel {$status}: {$this->errorCode}", $status);
     }
