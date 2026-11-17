@@ -50,10 +50,9 @@ class Matheel
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         if ($raw === false) {
             $error = curl_error($ch);
-            curl_close($ch);
             return [0, ['error' => 'network_error', 'message' => $error]];
         }
-        curl_close($ch);
+        // No curl_close: it does nothing since PHP 8.0 and is deprecated in 8.5; the handle is freed with $ch.
         $parsed = $raw === '' ? [] : json_decode($raw, true);
         return [$status, is_array($parsed) ? $parsed : ['error' => 'invalid_json', 'raw' => $raw]];
     }
