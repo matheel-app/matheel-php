@@ -46,6 +46,12 @@ class Matheel
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
         ]);
+        // Some networks between a cloud host and Matheel's edge drop the large post-quantum ClientHello that
+        // OpenSSL 3.5 sends by default (measured 2026-11-17: PHP curl failed, the same call with X25519 succeeded).
+        // The option exists from PHP 8.2; older PHP ships older OpenSSL, which never sends that key share.
+        if (defined('CURLOPT_SSL_EC_CURVES')) {
+            curl_setopt($ch, constant('CURLOPT_SSL_EC_CURVES'), 'X25519:P-256:P-384');
+        }
         $raw = curl_exec($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         if ($raw === false) {
